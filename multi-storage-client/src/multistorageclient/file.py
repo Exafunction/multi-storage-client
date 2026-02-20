@@ -180,6 +180,85 @@ class RemoteFileReader(IO[bytes]):
         return byte
 
 
+class StreamingWriteFile(IOBase):
+    """
+    A write-only file-like object that streams data to S3 via os.pipe() and a
+    background upload thread, avoiding buffering the entire file in BytesIO.
+
+    Supports write(), tell(), flush(), and close(). seek() is not supported.
+    """
+
+    def __init__(self, storage_client: "AbstractStorageClient", remote_path: str, attributes: Optional[dict[str, str]] = None):
+        self._storage_client = storage_client
+        self._remote_path = remote_path
+        self._attributes = attributes
+        self._bytes_written = 0
+        self._closed = False
+        self._upload_error: Optional[Exception] = None
+
+        self._read_fd, self._write_fd = os.pipe()
+        self._read_file = os.fdopen(self._read_fd, "rb")
+        self._write_file = os.fdopen(self._write_fd, "wb")
+
+        self._upload_thread = threading.Thread(target=self._upload_worker, daemon=True)
+        self._upload_thread.start()
+
+    def _upload_worker(self) -> None:
+        try:
+            self._storage_client.upload_file(self._remote_path, self._read_file, attributes=self._attributes)
+        except Exception as e:
+            self._upload_error = e
+        finally:
+            self._read_file.close()
+
+    def write(self, b: Any) -> int:
+        if self._closed:
+            raise ValueError("I/O operation on closed file.")
+        if self._upload_error:
+            raise self._upload_error
+        n = self._write_file.write(b)
+        self._bytes_written += n
+        return n
+
+    def tell(self) -> int:
+        return self._bytes_written
+
+    def seek(self, position: int, whence: int = 0) -> int:
+        raise io.UnsupportedOperation("seek")
+
+    def seekable(self) -> bool:
+        return False
+
+    def readable(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def flush(self) -> None:
+        if not self._closed:
+            self._write_file.flush()
+
+    def fsync(self) -> None:
+        pass
+
+    def discard(self) -> None:
+        pass
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._write_file.close()
+        self._upload_thread.join()
+        if self._upload_error:
+            raise self._upload_error
+
+
 # pylint: disable=abstract-method
 class ObjectFile(IOBase, IO):
     """
@@ -301,8 +380,12 @@ class ObjectFile(IOBase, IO):
                 self._download_complete = threading.Event()
                 self._download_thread = threading.Thread(target=self._download_fileobj)
                 self._download_thread.start()
+            elif self._mode == "wb":
+                # Streaming write: pipe data directly to S3 upload
+                self._streaming_writer = StreamingWriteFile(storage_client, remote_path, attributes=attributes)
+                self._file = self._streaming_writer
             else:
-                # Write or append
+                # Write text or append
                 self._create_fileobj()
 
         if attributes:
@@ -537,6 +620,8 @@ class ObjectFile(IOBase, IO):
             # Ensure the download thread finishes (if it exists)
             if hasattr(self, "_download_thread") and self._download_thread.is_alive():
                 self._download_thread.join()
+        elif hasattr(self, "_streaming_writer"):
+            self._streaming_writer.close()
         else:
             self._upload_file()
 
@@ -547,6 +632,8 @@ class ObjectFile(IOBase, IO):
         """
         Upload the file to object store.
         """
+        if hasattr(self, "_streaming_writer"):
+            return
         if self._mode in ("w", "wb"):
             self._file.seek(0)
             self._storage_client.upload_file(self._remote_path, self._file, attributes=self._attributes)
