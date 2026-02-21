@@ -676,6 +676,9 @@ class S3StorageProvider(BaseStorageProvider):
         else:
             # Non-seekable streams (e.g. pipes from StreamingWriteFile) go
             # directly to multipart upload — size is unknown upfront.
+            # Note: not retryable at this layer — the pipe is consumed on first
+            # attempt. The outer @retry only retries RetryableError, and boto3
+            # raises ClientError, so this is safe.
             if not hasattr(f, "seekable") or not f.seekable():
                 bucket, key = split_path(remote_path)
 

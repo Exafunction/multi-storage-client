@@ -15,6 +15,7 @@
 
 from __future__ import annotations  # Enables forward references in type hints
 
+import fcntl
 import io
 import json
 import logging
@@ -23,7 +24,7 @@ import tempfile
 import threading
 from collections.abc import Iterator
 from io import BytesIO, IOBase, StringIO
-from typing import IO, TYPE_CHECKING, Any, Optional, cast
+from typing import IO, TYPE_CHECKING, Any, Optional, Union, cast
 
 import xattr
 
@@ -197,10 +198,14 @@ class StreamingWriteFile(IOBase):
         self._upload_error: Optional[Exception] = None
 
         self._read_fd, self._write_fd = os.pipe()
+        try:
+            fcntl.fcntl(self._write_fd, 1031, 1024 * 1024)  # F_SETPIPE_SZ = 1031, 1 MB
+        except OSError:
+            pass
         self._read_file = os.fdopen(self._read_fd, "rb")
         self._write_file = os.fdopen(self._write_fd, "wb")
 
-        self._upload_thread = threading.Thread(target=self._upload_worker, daemon=True)
+        self._upload_thread = threading.Thread(target=self._upload_worker, daemon=False)
         self._upload_thread.start()
 
     def _upload_worker(self) -> None:
@@ -211,12 +216,18 @@ class StreamingWriteFile(IOBase):
         finally:
             self._read_file.close()
 
-    def write(self, b: Any) -> int:
+    def write(self, b: Union[bytes, bytearray, memoryview]) -> int:
         if self._closed:
             raise ValueError("I/O operation on closed file.")
         if self._upload_error:
             raise self._upload_error
-        n = self._write_file.write(b)
+        try:
+            n = self._write_file.write(b)
+        except BrokenPipeError:
+            self._upload_thread.join(timeout=5)
+            if self._upload_error:
+                raise self._upload_error
+            raise
         self._bytes_written += n
         return n
 
