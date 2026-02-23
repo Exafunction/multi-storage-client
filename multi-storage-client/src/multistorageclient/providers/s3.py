@@ -674,6 +674,34 @@ class S3StorageProvider(BaseStorageProvider):
 
             return self._translate_errors(_invoke_api, operation="PUT", bucket=bucket, key=key)
         else:
+            # Non-seekable streams (e.g. pipes from StreamingWriteFile) go
+            # directly to multipart upload — size is unknown upfront.
+            # Note: not retryable at this layer — the pipe is consumed on first
+            # attempt. The outer @retry only retries RetryableError, and boto3
+            # raises ClientError, so this is safe.
+            if not hasattr(f, "seekable") or not f.seekable():
+                bucket, key = split_path(remote_path)
+
+                def _invoke_streaming_api() -> int:
+                    extra_args = {}
+                    if content_type:
+                        extra_args["ContentType"] = content_type
+                    if self._is_directory_bucket(bucket):
+                        extra_args["StorageClass"] = EXPRESS_ONEZONE_STORAGE_CLASS
+                    validated_attributes = validate_attributes(attributes)
+                    if validated_attributes:
+                        extra_args["Metadata"] = validated_attributes
+                    self._s3_client.upload_fileobj(
+                        Fileobj=f,
+                        Bucket=bucket,
+                        Key=key,
+                        Config=self._transfer_config,
+                        ExtraArgs=extra_args,
+                    )
+                    return 0
+
+                return self._translate_errors(_invoke_streaming_api, operation="PUT", bucket=bucket, key=key)
+
             # Upload small files
             f.seek(0, io.SEEK_END)
             file_size = f.tell()
